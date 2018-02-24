@@ -262,7 +262,18 @@ void pigz_assemble(pigz_functions* result) {
 }
 
 int main() {
+  int result;
   pigz_functions asmf;
   pigz_assemble(&asmf);
-  return run_all_pigz_test_cases(&asmf) != 0;
+  asmf.allow_bmi2 = 0;
+  result = (run_all_pigz_test_cases(&asmf) != 0);
+  if (result == 0) {
+    pigz_state state;
+    asmf.init(&state, 0, 0);
+    if (state.status & 1) {
+      asmf.allow_bmi2 = 1;
+      result = (run_all_pigz_test_cases(&asmf) != 0);
+    }
+  }
+  return result;
 }

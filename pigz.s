@@ -19,12 +19,13 @@
 // The first letter indicates bit width: R=64, E=32, W=16, B=8
 // Other registers are used transiently: rax, rbx, rcx, rdx, xmm0-3
 |.define Rstate, rbp
-|.define Elitmask, r12d  // ((1 << state->litbits) - 1)
-|.define Edistmask, r13d // ((1 << state->distbits) - 1)
+|.define Elitmask, r12d  // state->litbits if BMI2 else ((1 << state->litbits) - 1)
+|.define Edistmask, r13d // state->distbits if BMI2 else ((1 << state->distbits) - 1)
 |.define Rbits, r8       // state->bits (only the low Enbits bits are valid)
 |.define Ebits, r8d
 |.define Wbits, r8w
 |.define Bbits, r8b
+|.define Rnbits, rsi
 |.define Enbits, esi     // state->nbits
 |.define Bnbits, r6b
 |.define Rinput, r9      // state->input
@@ -456,26 +457,28 @@ cfa -= 8;
   |  jmp rax
   |->unexpected_eof:
   // Pre-conditions: reader function returned a zero-length chunk
-  |  cmp byte State->status, 6
+  |  cmp byte State->status, 12
   |  mov byte State->status, PIGZ_STATUS_UNEXPECTED_EOF ^ 0x80
-  |  jnz >1
+  |  jb >1
   |  or rcx, Rwritepos
   |  jnz >1
-  // If status was 6 ("expecting gzip header"), and writepos was zero, and nbits
-  // was zero, then EOF was expected. Otherwise, it was unexpected.
+  // If status was 12/13 ("expecting gzip header"), and writepos was zero, and
+  // nbits was zero, then EOF was expected. Otherwise, it was unexpected.
   |  mov byte State->status, PIGZ_STATUS_EOF ^ 0x80
   |1:
   |  jmp ->return_from_available
   // End of need_reader_bits
 }
 
+|->fetch_next_block_bmi2:
+|  add Rinend, 4
 |->fetch_next_block:
 // Pre-conditions: Usual pigz_available stack frame and register assignments
 // Pre-conditions: A deflate block has just ended, and either another block
 // or a gzip footer follows.
 |  needbits
 |  movzx ebx, byte State->status
-|  test bl, 1
+|  test bl, 2
 |  jnz ->gz_tail
 |->fetch_next_block_got_bits:
 // Pre-conditions: A deflate block is expected.
@@ -486,10 +489,12 @@ cfa -= 8;
 |  sub Enbits, 3
 |  cmp bl, 6
 |  jae ->bad_bits // Invalid block type
-|  mov State->status, bl
-|  cmp bl, 2
-|  jb ->prepare_uncompressed_block
+|  shl ebx, 1
+|  and byte State->status, 1
+|  or State->status, bl
 |  cmp bl, 4
+|  jb ->prepare_uncompressed_block
+|  cmp bl, 8
 |  jb ->prepare_static_huffman_block
 {
   // Known: BTYPE==10 (the next block is "compressed with dynamic Huffman codes")
@@ -891,9 +896,19 @@ cfa -= 8;
 |  movzx eax, byte State->status
 |  mov Rwritegoal, State->readpos
 |  add Rwritegoal, PIGZ_READ_SIZE
-|  cmp eax, 2
+|  cmp eax, 4
 |  jl ->fetch_uncompressed
+|  cmp eax, 12
+|  jge ->gz_head
 |  movzx ecx, word State->litbits
+|  test eax, 1
+|  jz >1
+|  sub Rinend, 4
+|  movzx Elitmask, cl
+|  movzx ecx, ch
+|  mov Edistmask, ecx
+|  jmp ->fetch_compressed_main_loop_bmi2
+|1:
 |  movzx Elitmask, byte [Rcrc_table + 114] // 1
 |  mov Edistmask, Elitmask
 |  shl Elitmask, cl
@@ -901,8 +916,8 @@ cfa -= 8;
 |  shl Edistmask, cl
 |  sub Elitmask, 1
 |  sub Edistmask, 1
-|  cmp eax, 6
-|  jl ->fetch_compressed_main_loop
+|  jmp ->fetch_compressed_main_loop
+|->gz_head:
 |  cmp Rwritepos, State->readpos
 |  jnz ->return_from_available
 {
@@ -1007,7 +1022,7 @@ cfa -= 8;
 |  jnz ->bad_bits
 |  shr Rbits, 32
 |  sub Enbits, 32
-|  mov byte State->status, 6
+|  or byte State->status, 12
 |  jmp ->status_dispatch
 
 |->fetch_uncompressed:
@@ -1111,6 +1126,220 @@ cfa -= 8;
 |  sub Rstate, offsetof(pigz_state, litcodes) - offsetof(pigz_state, distcodes)
 |  call ->make_tables
 |  jmp ->make_tables_tidyup_state_dispatch
+{
+  // Start of main decompression loop, when CPU has support for BMI2
+  // NB: The loop entry point is ->fetch_compressed_main_loop_bmi2
+
+  |.align 16
+  |->need_reader_bits_bmi2:
+  |  cmp Enbits, 48
+  |  jge ->got_reader_bits_bmi2
+  |  lea rcx, [Rinend + 8]
+  |  cmp Rinput, rcx
+  |  jz >1
+  |2:
+  |  movzx edx, byte [Rinput]
+  |  add Rinput, 1
+  |  shlx rdx, rdx, Rnbits
+  |  add Enbits, 8
+  |  or Rbits, rdx
+  |  cmp Enbits, 48
+  |  jge ->got_reader_bits_bmi2
+  |  cmp Rinput, rcx
+  |  jnz <2
+  |1:
+  // Call the reader function to get more input
+  |  mov State->bits, Rbits
+  |  mov State->nbits, Bnbits
+  |  mov State->crc, Ecrc
+  |  mov Rarg1, State->opaque
+  |  mov Rarg2, State
+  |  call aword State->reader
+  |  mov Rinend, [State]
+  |  mov Rinput, rax
+  |  mov Rbits, State->bits
+  |  movzx Enbits, byte State->nbits
+  |  mov Ecrc, State->crc
+  |  lea Rcrc_table, [->pigz_crc_table]
+  |  cmp Rinend, 8
+  |  lea Rinend, [Rinput + Rinend - 8]
+  |  jae ->got_reader_bytes_bmi2
+  |  lea rcx, [Rinend + 8]
+  |  cmp Rinput, rcx
+  |  jnz <2
+  |  mov byte State->status, PIGZ_STATUS_UNEXPECTED_EOF ^ 0x80
+  |  jmp ->return_from_available_bmi2
+
+  |.align 16
+  |->lit_not_lit_bmi2:
+  // Pre-conditions: KIND == 2 (i.e. either end-of-block or error)
+  // Pre-conditions: ebx contains VAL
+  |  test ebx, ebx
+  |  jz ->fetch_next_block_bmi2
+  |->bad_bits_bmi2:
+  |  mov byte State->status, PIGZ_STATUS_BAD_BITS ^ 0x80
+  |->return_from_available_bmi2:
+  |  add Rinend, 4
+  |  jmp ->return_from_available
+  |->lit_not_length_bmi2:
+  // Pre-conditions: flags set by "cmp al, 64"
+  // Pre-conditions: 1 <= KIND <= 2
+  // Pre-conditions: al contains (KIND << 6)
+  // Pre-conditions: ebx contains VAL
+  |  .byte 0x2E; jnz ->lit_not_lit_bmi2
+  // Known: KIND == 1 (i.e. VAL is a literal value)
+  |  movzx eax, Wwritepos
+  |  add Rwritepos, 1
+  |  .byte 0x40; mov [Rstate + eax*1 + offsetof(pigz_state, window)], bl
+  |.if CRC
+  |  xor bl, Bcrc
+  |  .byte 0x40; shr Ecrc, 8
+  |  xor Ecrc, [Rcrc_table + ebx*4]
+  |.endif
+  |->fetch_compressed_main_loop_bmi2:
+  // Pre-conditions: Usual pigz_available stack frame and register assignments
+  |  cmp Rwritepos, Rwritegoal
+  |  jae ->return_from_available_bmi2
+  |  cmp Rinend, Rinput
+  |  jb ->need_reader_bits_bmi2
+  |->got_reader_bytes_bmi2:
+  |  shlx rax, [Rinput], Rnbits
+  |  or Rbits, rax
+  |  lea eax, [Enbits - 63]
+  |  or Enbits, 56
+  |  neg eax
+  |  shr eax, 3
+  |  add Rinput, rax
+  |->got_reader_bits_bmi2:
+  // Known: enough bits are available for any literal/length code and then any distance code
+  |  bzhi ebx, Ebits, Elitmask
+  {
+    |->load_lit_code_bmi2:
+    // Pre-conditions: ebx is an index into state->litcodes
+    // Replaces ebx with the VAL from litcodes
+    |  mov eax, [Rstate + ebx*4 + offsetof(pigz_state, litcodes)]
+    // Known: al contains (KIND << 6) | NXBITS
+    |  movzx ecx, ah
+    // Known: ecx contains NBITS
+    |  mov ebx, eax
+    |  and ebx, 63
+    // Known: ebx contains NXBITS
+    |  shrx Rbits, Rbits, rcx
+    |  sub Enbits, ecx
+    |  rorx rcx, rax, 16
+    |  bzhi ebx, Ebits, ebx
+    |  add ebx, ecx
+    // Known: ebx contains VAL
+    |  cmp al, 192
+    |  jae ->load_lit_code_bmi2
+  }
+  |  sub Enbits, eax
+  |  shrx Rbits, Rbits, rax // NB: Ignores the high two bits of al
+  |  and Enbits, 63
+  |  cmp al, 64
+  |  jae ->lit_not_length_bmi2
+  // Known: KIND == 0 (i.e. VAL is a length value)
+  |  bzhi edx, Ebits, Edistmask
+  {
+    |->load_dist_code_bmi2:
+    // Pre-conditions: ebx contains a length value
+    // Pre-conditions: edx is an index into state->distcodes
+    // Replaces edx with the VAL from distcodes
+    |  mov eax, [Rstate + edx*4 + offsetof(pigz_state, distcodes)]
+    // Known: al contains (KIND << 6) | NXBITS
+    |  movzx ecx, ah
+    // Known: ecx contains NBITS
+    |  mov edx, eax
+    |  and edx, 63
+    // Known: edx contains NXBITS
+    |  shrx Rbits, Rbits, rcx
+    |  sub Enbits, ecx
+    |  rorx rcx, rax, 16
+    |  bzhi edx, Ebits, edx
+    |  add edx, ecx
+    // Known: edx contains VAL
+    |  cmp al, 192
+    |  jae ->load_dist_code_bmi2
+  }
+  |  test al, 192
+  |  .byte 0x2E; jnz ->bad_bits_bmi2
+  // Known: KIND == 0 (i.e. VAL is a distance value)
+  // Replace edx with (writepos - edx) & (PIGZ_WINDOW_SIZE - 1)
+  |  neg rdx
+  |  sub Bnbits, al
+  |  shrx Rbits, Rbits, rax
+  |  add rdx, Rwritepos
+  |  .byte 0x2E; js ->bad_bits_bmi2 // Distance is greater than writepos
+  |  .byte 0x40; movzx edx, dx
+  |  movzx ecx, Wwritepos
+  // Start of backref-copy loop
+  // Invariants: ebx contains number of bytes remaining to copy
+  // Invariants: ecx contains the window index of the next byte to write
+  // Invariants: edx contains the window index of the next byte to read
+  |  add Rwritepos, rbx
+  |.if CRC
+  |  movd xmm0, esi // Temporarily spill esi
+  |.endif
+  |  .byte 0x40; test ebx, 3
+  |  jz ->backref_copy4_bmi2
+  {
+    |->backref_copy_bmi2: // One-byte-at-a-time backref-copy loop (at most three iterations)
+    |  .byte 0x40; movzx eax, byte [Rstate + edx*1 + offsetof(pigz_state, window)]
+    |  inc dx
+    |  mov [Rstate + ecx*1 + offsetof(pigz_state, window)], al
+    |.if CRC
+    |  xor al, Bcrc
+    |  shr Ecrc, 8
+    |.endif
+    |  inc cx
+    |.if CRC
+    |  xor Ecrc, [Rcrc_table + eax*4]
+    |.endif
+    |  .byte 0x81, 0xEB, 0x01, 0x00, 0x00, 0x00 // sub ebx, dword 1
+    |  .byte 0x2E; jz ->fetch_compressed_main_loop_bmi2
+    |  .byte 0x40; test ebx, 3
+    |  jnz ->backref_copy_bmi2
+  }
+  {
+    |->backref_copy4_bmi2: // Four-bytes-at-a-time backref-copy loop (at most 64 iterations)
+    // Pre-conditions: 0 < ebx <= 256, (ebx & 3) == 0
+    // The input might overlap the output, so reads from the window and writes to
+    // the window are still done one byte at a time, but the unrolling massively
+    // helps the CRC calculation (and also reduces ebx manipulations).
+    for (i = 3; i >= 0; --i) {
+      |  movzx eax, byte [Rstate + edx*1 + offsetof(pigz_state, window)]
+      |  inc dx
+      |  mov [Rstate + ecx*1 + offsetof(pigz_state, window)], al
+      |.if CRC
+      if (i) {
+        |  xor al, Bcrc
+        |  shr Ecrc, 8
+      } else {
+        |  xor eax, Ecrc
+      }
+      |.endif
+      |  inc cx
+      |.if CRC
+      if (i == 3) {
+        |  mov esi, [Rcrc_table + eax*4 + 256*4*i]
+      } else if (i) {
+        |  xor esi, [Rcrc_table + eax*4 + 256*4*i]
+      } else {
+        |  xor esi, [Rcrc_table + eax*4]
+        |  mov Ecrc, esi
+      }
+      |.endif
+    }
+    |  sub ebx, 4
+    |  jnz ->backref_copy4_bmi2
+  }
+  |.if CRC
+  |  movd esi, xmm0 // Restore esi (it was spilled before the loop)
+  |.endif
+  // End of backref-copy loop
+  |  jmp ->fetch_compressed_main_loop_bmi2
+  // End of main decompression loop
+}
 |=>asm_cfi_endproc():
 
 {
@@ -1254,7 +1483,20 @@ cfa -= 8;
   |  mov State:Rarg1->bits, rax
   |  or al, 4
   |  mov State:Rarg1->input, rax
-  |  or al, 2
+  |  or al, 3
+  |.if WIN
+  |  push Rarg1
+  |.endif
+  |  xor ecx, ecx
+  |  push rbx
+  |  cpuid
+  |  movzx eax, bh
+  |  pop rbx
+  |.if WIN
+  |  pop Rarg1
+  |.endif
+  |  and al, 1
+  |  or al, 12
   |  mov State:Rarg1->status, eax
   |  ret
   |.if not WIN

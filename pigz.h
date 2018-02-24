@@ -148,12 +148,14 @@ typedef struct pigz_state {
    *
    * Internal to the library, there are three kinds of non-negative value in
    * this field: <ul>
-   *  <li>Values in the range 0 through 5 are used to denote the current block
+   *  <li>Values in the range 0 through 11 are used to denote the current block
    *      type and whether the current block is the final block (the low bit is
-   *      @c BFINAL, the next two bits are @c BTYPE).</li>
-   *  <li>The value 6 denotes being at a gzip file boundary - the @c CRC32 and
-   *      @c ISIZE fields of the previous gzip file have been verified, but the
-   *      header of the next gzip file has yet to be looked at.</li>
+   *      set if the CPU supports BMI2, the next bit is @c BFINAL, the next two
+   *      bits are @c BTYPE).</li>
+   *  <li>The values 12 and 13 denotes being at a gzip file boundary - the
+   *      @c CRC32 and @c ISIZE fields of the previous gzip file have been
+   *      verified, but the header of the next gzip file has yet to be looked
+   *      at. The value 13 is used if (and only if) the CPU supports BMI2.</li>
    *  <li>Values in the range 64 through 127 denote that an error has occurred,
    *      but some uncompressed bytes have yet to be consumed, so said error
    *      has not yet been revealed. Once the bytes have been consumed, it'll
@@ -173,7 +175,8 @@ typedef struct pigz_state {
      * When uncompressing an uncompressed-block, the number of literal bytes
      * remaining in the block.
      *
-     * This field is valid when @c status is 0 or 1 (i.e. @c BTYPE is 00).
+     * This field is valid when @c status is in the range 0 through 3 (i.e.
+     * @c BTYPE is 00).
      */
     uint16_t litlen;
     struct {
@@ -181,7 +184,7 @@ typedef struct pigz_state {
        * When uncompressing a compressed block, log2 of the size of the
        * first-level table in @c litcodes. Always in the range 1 through 9.
        *
-       * This field is valid when @c status is in the range 2 through 5 (i.e.
+       * This field is valid when @c status is in the range 4 through 11 (i.e.
        * @c BTYPE is 01 or 10).
        */
       uint8_t litbits;
@@ -190,7 +193,7 @@ typedef struct pigz_state {
        * When uncompressing a compressed block, log2 of the size of the
        * first-level table in @c distcodes. Always in the range 0 through 6.
        *
-       * This field is valid when @c status is in the range 2 through 5 (i.e.
+       * This field is valid when @c status is in the range 4 through 11 (i.e.
        * @c BTYPE is 01 or 10).
        */
       uint8_t distbits;
@@ -275,6 +278,9 @@ typedef struct pigz_state {
  * that will happen on the next call to @c pigz_available. Initialisation
  * does not allocate any resources, and cannot fail. There is no corresponding
  * de-initialisation function, as such a function is not required.
+ *
+ * If the CPU supports BMI2, pigz will use it. To prevent use of BMI2, clear
+ * the low bit of the @c status field after calling @c pigz_init.
  *
  * @param state The state to initialise.
  * @param opaque An opaque value which will later be passed to @p reader.

@@ -54,6 +54,9 @@ int main(int argc, const char** argv) {
   }
   buf.n = (argc >= 3) ? atoi(argv[2]) : 2;
   pigz_init(&p, &buf, readbuf);
+  if (argc >= 4 && strcmp(argv[3], "--no-bmi2") == 0) {
+    p.status &=~ (int8_t)1;
+  }
   while ((n = pigz_available(&p))) {
     pigz_consume(&p, n);
   }

@@ -75,6 +75,13 @@ static const char* verbatim_reader_fn(void* opaque, uint64_t* len) {
   }
 }
 
+static void call_init(const pigz_functions* funcs, pigz_state* state, void* opaque, pigz_reader reader) {
+  funcs->init(state, opaque, reader);
+  if (!funcs->allow_bmi2) {
+    state->status &=~ (int8_t)1;
+  }
+}
+
 static uint32_t run_verbatim_test_cases(const pigz_functions* funcs) {
   uint32_t nfail = 0;
   pigz_state state;
@@ -87,7 +94,7 @@ static uint32_t run_verbatim_test_cases(const pigz_functions* funcs) {
       reader.input = test_case->input;
       reader.input_len = test_case->input_len;
       printf("%s %d: ", test_case->name, (int)reader.chunk_size);
-      funcs->init(&state, &reader, verbatim_reader_fn);
+      call_init(funcs, &state, &reader, verbatim_reader_fn);
       while ((available = funcs->available(&state))) {
         const char* buf = funcs->consume(&state, available);
         if (test_case->output && memcmp(buf, test_case->output + total, available) != 0) {
@@ -179,7 +186,7 @@ static uint32_t run_one_byte_test_cases(const pigz_functions* funcs) {
     reader.byteval = (char)(n ^ 255);
     reader.state = 0;
     printf("one_byte_lit-%d: ", n);
-    funcs->init(&state, &reader, one_byte_reader_literal);
+    call_init(funcs, &state, &reader, one_byte_reader_literal);
     result = funcs->available(&state) ? funcs->consume(&state, 1) : NULL;
     if (!result || *result != reader.byteval || funcs->available(&state) || state.status != PIGZ_STATUS_EOF) {
       printf("FAIL\n");
@@ -191,7 +198,7 @@ static uint32_t run_one_byte_test_cases(const pigz_functions* funcs) {
     reader.byteval = (char)(n ^ 255);
     reader.state = 0;
     printf("one_byte_static-%d: ", n);
-    funcs->init(&state, &reader, one_byte_reader_static);
+    call_init(funcs, &state, &reader, one_byte_reader_static);
     result = funcs->available(&state) ? funcs->consume(&state, 1) : NULL;
     if (!result || *result != reader.byteval || funcs->available(&state) || state.status != PIGZ_STATUS_EOF) {
       printf("FAIL\n");
@@ -298,7 +305,7 @@ static uint32_t run_fixed_size_record_test_cases(const pigz_functions* funcs) {
         reader.record[5 + k] = 1 + k;
       }
       printf("fixed_size_record-%d-%d: ", (int)i, (int)j);
-      funcs->init(&state, &reader, fixed_size_record_reader_fn);
+      call_init(funcs, &state, &reader, fixed_size_record_reader_fn);
       result = funcs->available(&state) >= i ? funcs->consume(&state, i) : NULL;
       if (!result || memcmp(result, reader.initial + 5, i)) {
         printf("FAIL\n");
