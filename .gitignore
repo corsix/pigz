@@ -1,0 +1,5 @@
+*.bin
+*.bin.dSYM
+*.o
+pigz_s.h
+pigz_o.s
