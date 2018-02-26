@@ -471,7 +471,7 @@ cfa -= 8;
 }
 
 |->fetch_next_block_bmi2:
-|  add Rinend, 4
+|  add Rinend, 11
 |->fetch_next_block:
 // Pre-conditions: Usual pigz_available stack frame and register assignments
 // Pre-conditions: A deflate block has just ended, and either another block
@@ -903,10 +903,11 @@ cfa -= 8;
 |  movzx ecx, word State->litbits
 |  test eax, 1
 |  jz >1
-|  sub Rinend, 4
-|  movzx Elitmask, cl
-|  movzx ecx, ch
-|  mov Edistmask, ecx
+|  sub Rinend, 11
+|  mov Elitmask, ecx
+|  cmp Rinend, Rinput
+|  jb ->fetch_compressed_main_loop_bmi2
+|  mov r13, [Rinput]
 |  jmp ->fetch_compressed_main_loop_bmi2
 |1:
 |  movzx Elitmask, byte [Rcrc_table + 114] // 1
@@ -1134,7 +1135,7 @@ cfa -= 8;
   |->need_reader_bits_bmi2:
   |  cmp Enbits, 48
   |  jge ->got_reader_bits_bmi2
-  |  lea rcx, [Rinend + 8]
+  |  lea rcx, [Rinend + 15]
   |  cmp Rinput, rcx
   |  jz >1
   |2:
@@ -1161,10 +1162,13 @@ cfa -= 8;
   |  movzx Enbits, byte State->nbits
   |  mov Ecrc, State->crc
   |  lea Rcrc_table, [->pigz_crc_table]
-  |  cmp Rinend, 8
-  |  lea Rinend, [Rinput + Rinend - 8]
-  |  jae ->got_reader_bytes_bmi2
-  |  lea rcx, [Rinend + 8]
+  |  cmp Rinend, 15
+  |  lea Rinend, [Rinput + Rinend - 15]
+  |  jb >3
+  |  mov r13, [Rinput]
+  |  jmp ->got_reader_bytes_bmi2
+  |3:
+  |  lea rcx, [Rinend + 15]
   |  cmp Rinput, rcx
   |  jnz <2
   |  mov byte State->status, PIGZ_STATUS_UNEXPECTED_EOF ^ 0x80
@@ -1179,7 +1183,7 @@ cfa -= 8;
   |->bad_bits_bmi2:
   |  mov byte State->status, PIGZ_STATUS_BAD_BITS ^ 0x80
   |->return_from_available_bmi2:
-  |  add Rinend, 4
+  |  add Rinend, 11
   |  jmp ->return_from_available
   |->lit_not_length_bmi2:
   // Pre-conditions: flags set by "cmp al, 64"
@@ -1203,13 +1207,14 @@ cfa -= 8;
   |  cmp Rinend, Rinput
   |  jb ->need_reader_bits_bmi2
   |->got_reader_bytes_bmi2:
-  |  shlx rax, [Rinput], Rnbits
+  |  shlx rax, r13, Rnbits
   |  or Rbits, rax
   |  lea eax, [Enbits - 63]
   |  or Enbits, 56
   |  neg eax
   |  shr eax, 3
   |  add Rinput, rax
+  |  mov r13, [Rinput]
   |->got_reader_bits_bmi2:
   // Known: enough bits are available for any literal/length code and then any distance code
   |  bzhi ebx, Ebits, Elitmask
@@ -1239,7 +1244,8 @@ cfa -= 8;
   |  cmp al, 64
   |  jae ->lit_not_length_bmi2
   // Known: KIND == 0 (i.e. VAL is a length value)
-  |  bzhi edx, Ebits, Edistmask
+  |  rorx edx, Elitmask, 8
+  |  bzhi edx, Ebits, edx
   {
     |->load_dist_code_bmi2:
     // Pre-conditions: ebx contains a length value
@@ -1262,6 +1268,7 @@ cfa -= 8;
     |  jae ->load_dist_code_bmi2
   }
   |  test al, 192
+  |9:
   |  .byte 0x2E; jnz ->bad_bits_bmi2
   // Known: KIND == 0 (i.e. VAL is a distance value)
   // Replace edx with (writepos - edx) & (PIGZ_WINDOW_SIZE - 1)
@@ -1269,8 +1276,8 @@ cfa -= 8;
   |  sub Bnbits, al
   |  shrx Rbits, Rbits, rax
   |  add rdx, Rwritepos
-  |  .byte 0x2E; js ->bad_bits_bmi2 // Distance is greater than writepos
-  |  .byte 0x40; movzx edx, dx
+  |  .byte 0x2E; js <9 // Distance is greater than writepos
+  |  movzx edx, dx
   |  movzx ecx, Wwritepos
   // Start of backref-copy loop
   // Invariants: ebx contains number of bytes remaining to copy
@@ -1280,7 +1287,7 @@ cfa -= 8;
   |.if CRC
   |  movd xmm0, esi // Temporarily spill esi
   |.endif
-  |  .byte 0x40; test ebx, 3
+  |  test bl, 3
   |  jz ->backref_copy4_bmi2
   {
     |->backref_copy_bmi2: // One-byte-at-a-time backref-copy loop (at most three iterations)
